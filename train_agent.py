@@ -22,11 +22,11 @@ from sklearn.metrics import roc_auc_score
 # =========================
 # CONFIG
 # =========================
-CSV_TRAIN = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\calc_case_description_train_set.csv"
-CSV_TEST  = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\calc_case_description_test_set.csv"
+CSV_TRAIN = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\pbl5_AI\calc_case_description_train_set.csv"
+CSV_TEST  = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\pbl5_AI\calc_case_description_test_set.csv"
 
 
-IMAGES_ROOT = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\CBIS-DDSM"
+IMAGES_ROOT = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\pbl5_AI\CBIS-DDSM"
 
 USE_PATH_COL = "image file path"  # FULL images
 META_COLS = ["breast density", "assessment", "subtlety"]
