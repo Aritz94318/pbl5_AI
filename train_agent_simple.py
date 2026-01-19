@@ -15,8 +15,14 @@ import pydicom
 from PIL import Image
 
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
-
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    recall_score,
+)
 
 # =========================
 # CONFIG
@@ -25,16 +31,15 @@ CSV_TRAIN = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo
 CSV_TEST  = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\pbl5_AI\calc_case_description_test_set.csv"
 
 IMAGES_ROOT = r"D:\Clase\Ingeneria\3.Maila\1.Sehilekoa\PBL\Image\manifest-ZkhPvrLo5216730872708713142\pbl5_AI\CBIS-DDSM"
-
 USE_PATH_COL = "image file path"
 
 BATCH_SIZE = 8
 NUM_EPOCHS = 12
 
 # Fine-tuning 2 fases
-FREEZE_EPOCHS = 3         # épocas entrenando solo la cabeza (fc)
-LR_HEAD = 1e-3            # LR más alto para la cabeza
-LR_ALL  = 2e-4            # LR más bajo para toda la red
+FREEZE_EPOCHS = 5
+LR_HEAD = 1e-3
+LR_ALL  = 1e-4
 
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 2
@@ -50,6 +55,12 @@ LABEL_MAP = {
     "BENIGN_WITHOUT_CALLBACK": 0
 }
 
+# =========================
+# THRESHOLD / BALANCED CONFIG (NEW)
+# =========================
+TARGET_RECALL_MAL = 0.95        # mantiene sensibilidad alta
+THRESH_MODE = "max_balanced"    # maximiza balanced accuracy bajo ese constraint
+THRESH_GRID = 500
 
 # =========================
 # Reproducibility
@@ -82,6 +93,7 @@ def resolve_full_dicom_from_csv(rel_path: str) -> str | None:
     if not os.path.isdir(case_dir):
         return None
 
+    # Prioriza full mammogram
     full_candidates = glob.glob(
         os.path.join(case_dir, "**", "*full mammogram images*", "*.dcm"),
         recursive=True
@@ -93,6 +105,7 @@ def resolve_full_dicom_from_csv(rel_path: str) -> str | None:
                 return p
         return full_candidates[0]
 
+    # Fallback: cualquier dicom
     any_candidates = glob.glob(os.path.join(case_dir, "**", "*.dcm"), recursive=True)
     if any_candidates:
         any_candidates.sort()
@@ -120,7 +133,7 @@ def load_dicom_as_pil(dcm_path: str) -> Image.Image:
     img = np.clip(img, lo, hi)
     img = (img - lo) / (hi - lo + 1e-6)  # -> [0,1]
 
-    # ---- CROP simple de la región útil (quita fondo negro)
+    # crop simple (quita fondo negro)
     mask = img > 0.05
     if mask.any():
         ys, xs = np.where(mask)
@@ -155,7 +168,7 @@ class CBISImageDataset(Dataset):
 
 
 # =========================
-# Model (Transfer Learning ResNet18 -> 1 canal) canal1 solo grises
+# Model (Transfer Learning ResNet18 -> 1 canal)
 # =========================
 class ResNetBinaryTransfer(nn.Module):
     def __init__(self):
@@ -175,20 +188,25 @@ class ResNetBinaryTransfer(nn.Module):
 
 
 # =========================
-# Eval
+# Eval (prob maligno + AUC + recall_malignant by argmax)
 # =========================
 @torch.no_grad()
-def eval_epoch(model, loader, ce):
+def eval_epoch(model, loader, loss_fn):
     model.eval()
     losses = []
     ys = []
     preds = []
+    p_mal_list = []
 
     for img, y in loader:
         img, y = img.to(DEVICE), y.to(DEVICE)
         logits = model(img)
-        loss = ce(logits, y)
-        losses.append(loss.item())
+
+        loss = loss_fn(logits, y)
+        losses.append(float(loss.item()))
+
+        probs = torch.softmax(logits, dim=1)[:, 1]  # prob maligno
+        p_mal_list.extend(probs.detach().cpu().numpy().tolist())
 
         p = torch.argmax(logits, dim=1)
         ys.extend(y.detach().cpu().numpy().tolist())
@@ -196,7 +214,113 @@ def eval_epoch(model, loader, ce):
 
     acc = accuracy_score(ys, preds)
     f1 = f1_score(ys, preds, zero_division=0)
-    return float(np.mean(losses)), acc, f1, ys, preds
+
+    try:
+        auc = roc_auc_score(ys, p_mal_list)
+    except Exception:
+        auc = float("nan")
+
+    rec_mal = recall_score(ys, preds, pos_label=1, zero_division=0)
+
+    # NEW: devolvemos también p_mal_list
+    return float(np.mean(losses)), acc, f1, auc, rec_mal, ys, preds, p_mal_list
+
+
+# =========================
+# THRESHOLD utilities (NEW)
+# =========================
+def metrics_from_cm(cm: np.ndarray):
+    # cm = [[tn, fp],
+    #       [fn, tp]]
+    tn, fp, fn, tp = cm.ravel()
+    acc = (tp + tn) / max(1, (tp + tn + fp + fn))
+    rec_mal = tp / max(1, (tp + fn))         # sensibilidad maligno
+    spec = tn / max(1, (tn + fp))            # especificidad (benigno)
+    prec_mal = tp / max(1, (tp + fp))        # precision maligno
+    f1_mal = 2 * prec_mal * rec_mal / max(1e-12, (prec_mal + rec_mal))
+    bal_acc = 0.5 * (spec + rec_mal)         # balanced accuracy
+    return acc, prec_mal, rec_mal, spec, f1_mal, bal_acc
+
+
+def find_best_threshold_on_val(
+    ys_val: list[int],
+    p_mal_val: list[float],
+    target_recall_mal: float = 0.95,
+    mode: str = "max_balanced",   # "max_balanced" | "max_spec" | "max_f1"
+    n_grid: int = 500
+):
+    probs = np.array(p_mal_val, dtype=np.float32)
+    ys = np.array(ys_val, dtype=np.int64)
+
+    lo = float(np.clip(probs.min(), 0.0, 1.0))
+    hi = float(np.clip(probs.max(), 0.0, 1.0))
+    if hi - lo < 1e-6:
+        thr = 0.5
+        preds = (probs >= thr).astype(int)
+        cm = confusion_matrix(ys, preds, labels=[0, 1])
+        acc, prec, rec, spec, f1, bal = metrics_from_cm(cm)
+        return thr, cm, {"acc": acc, "prec_mal": prec, "rec_mal": rec, "spec": spec, "f1_mal": f1, "bal_acc": bal}
+
+    thresholds = np.linspace(lo, hi, n_grid)
+
+    best_thr = None
+    best_score = -1.0
+    best_cm = None
+    best_metrics = None
+
+    for thr in thresholds:
+        preds = (probs >= thr).astype(int)
+        cm = confusion_matrix(ys, preds, labels=[0, 1])
+        if cm.shape != (2, 2):
+            continue
+
+        acc, prec, rec, spec, f1, bal = metrics_from_cm(cm)
+
+        # constraint: recall maligno mínimo
+        if rec + 1e-12 < target_recall_mal:
+            continue
+
+        if mode == "max_balanced":
+            score = bal
+        elif mode == "max_spec":
+            score = spec
+        elif mode == "max_f1":
+            score = f1
+        else:
+            raise ValueError("mode must be: max_balanced, max_spec, max_f1")
+
+        if score > best_score:
+            best_score = score
+            best_thr = float(thr)
+            best_cm = cm
+            best_metrics = {"acc": acc, "prec_mal": prec, "rec_mal": rec, "spec": spec, "f1_mal": f1, "bal_acc": bal}
+
+    # fallback: si no hay threshold que cumpla el target, maximizamos balanced sin constraint
+    if best_thr is None:
+        best_thr = 0.5
+        best_score = -1.0
+        for thr in thresholds:
+            preds = (probs >= thr).astype(int)
+            cm = confusion_matrix(ys, preds, labels=[0, 1])
+            if cm.shape != (2, 2):
+                continue
+            acc, prec, rec, spec, f1, bal = metrics_from_cm(cm)
+            score = bal
+            if score > best_score:
+                best_score = score
+                best_thr = float(thr)
+                best_cm = cm
+                best_metrics = {"acc": acc, "prec_mal": prec, "rec_mal": rec, "spec": spec, "f1_mal": f1, "bal_acc": bal}
+
+    return best_thr, best_cm, best_metrics
+
+
+def print_threshold_report(name: str, ys: list[int], p_mal_list: list[float], threshold: float):
+    preds = [1 if p >= threshold else 0 for p in p_mal_list]
+    cm = confusion_matrix(ys, preds, labels=[0, 1])
+    print(f"\n==== {name} (threshold={threshold:.4f}) ====")
+    print("Confusion matrix:\n", cm)
+    print(classification_report(ys, preds, digits=4))
 
 
 def set_requires_grad_backbone(model: ResNetBinaryTransfer, train_backbone: bool):
@@ -217,18 +341,22 @@ def make_optimizer(model, lr):
 
 
 def train():
+    # Guardado
     here = os.path.dirname(os.path.abspath(__file__))
     SAVE_PATH = os.path.join(here, "artifacts", "best_model.pt")
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     print("Checkpoint se guardará en:", SAVE_PATH)
     print("DEVICE =", DEVICE)
 
+    # Leer CSV
     df_train = pd.read_csv(CSV_TRAIN)
     df_test  = pd.read_csv(CSV_TEST)
 
+    # Limpieza básica
     df_train = df_train.dropna(subset=[USE_PATH_COL, "pathology", "patient_id"])
     df_test  = df_test.dropna(subset=[USE_PATH_COL, "pathology", "patient_id"])
 
+    # Resolver paths DICOM
     df_train["abs_path"] = df_train[USE_PATH_COL].apply(resolve_full_dicom_from_csv)
     df_test["abs_path"]  = df_test[USE_PATH_COL].apply(resolve_full_dicom_from_csv)
 
@@ -239,6 +367,7 @@ def train():
     print(f"Resolved train: {len(df_train)}/{before_tr}")
     print(f"Resolved test : {len(df_test)}/{before_te}")
 
+    # Split train/val por paciente
     gss = GroupShuffleSplit(test_size=0.15, n_splits=1, random_state=SEED)
     tr_idx, va_idx = next(gss.split(df_train, groups=df_train["patient_id"]))
     tr_df = df_train.iloc[tr_idx].copy()
@@ -246,18 +375,24 @@ def train():
 
     print("Val pathology counts:\n", va_df["pathology"].value_counts())
 
-    # ---- Class weights desde TRAIN split
+    # ---- Class weights SUAVIZADOS: sqrt(1/count)
     y_train = tr_df["pathology"].map(lambda x: LABEL_MAP[str(x)]).astype(int).values
     counts = np.bincount(y_train, minlength=2)
-    weights = np.where(counts > 0, 1.0 / counts, 0.0)
-    weights = weights / weights.sum() * 2.0  # normaliza para que sum ~2
+    counts_safe = np.maximum(counts, 1)
+
+    weights = np.sqrt(1.0 / counts_safe)
+    weights = weights / weights.sum() * 2.0  # sum ~2
     class_weights = torch.tensor(weights, dtype=torch.float32).to(DEVICE)
 
     print("Train class counts:", counts.tolist())
-    print("Class weights:", class_weights.detach().cpu().numpy().tolist())
+    print("Class weights (sqrt inv):", class_weights.detach().cpu().numpy().tolist())
 
-    ce = nn.CrossEntropyLoss(weight=class_weights)
+    # =========================
+    # LOSS (CHANGED): CrossEntropy + class weights (más balanceado que Focal)
+    # =========================
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
+    # ---- Transforms
     tfm_train = T.Compose([
         T.Resize((IMG_SIZE, IMG_SIZE)),
         T.RandomApply([T.RandomRotation(7)], p=0.5),
@@ -271,15 +406,20 @@ def train():
         T.Normalize(mean=[0.5], std=[0.25]),
     ])
 
+    # ---- Datasets
     ds_tr = CBISImageDataset(tr_df, tfm_train)
     ds_va = CBISImageDataset(va_df, tfm_eval)
     ds_te = CBISImageDataset(df_test, tfm_eval)
 
+    ds_tr_eval = CBISImageDataset(tr_df, tfm_eval)
+
     pin = (DEVICE == "cuda")
-    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=pin)
+    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=pin)
     dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin)
     dl_te = DataLoader(ds_te, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin)
+    dl_tr_eval = DataLoader(ds_tr_eval, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin)
 
+    # ---- Model
     model = ResNetBinaryTransfer().to(DEVICE)
 
     # =========================
@@ -289,12 +429,17 @@ def train():
     opt = make_optimizer(model, lr=LR_HEAD)
     print(f"FASE 1: entrenando solo fc durante {FREEZE_EPOCHS} épocas (lr={LR_HEAD})")
 
-    best_f1 = -1.0
-    patience = 4
+    # =========================
+    # CHECKPOINT (CHANGED):
+    #   Constraint: val_recall_mal >= 0.95
+    #   Objetivo: max val_auc (mejor separación)
+    # =========================
+    best_auc = -1.0
+
+    patience = 5
     bad = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        # pasar a fase 2 cuando toque
         if epoch == FREEZE_EPOCHS + 1:
             set_requires_grad_backbone(model, train_backbone=True)
             opt = make_optimizer(model, lr=LR_ALL)
@@ -309,7 +454,7 @@ def train():
             opt.zero_grad(set_to_none=True)
 
             logits = model(img)
-            loss = ce(logits, y)
+            loss = loss_fn(logits, y)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -320,19 +465,28 @@ def train():
             n += bs
 
         tr_loss = total / max(1, n)
-        va_loss, va_acc, va_f1, _, _ = eval_epoch(model, dl_va, ce)
+        va_loss, va_acc, va_f1, va_auc, va_rec_mal, _, _, _ = eval_epoch(model, dl_va, loss_fn)
 
-        print(f"[{epoch:02d}] train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}  val_acc={va_acc:.4f}  val_f1={va_f1:.4f}")
+        print(
+            f"[{epoch:02d}] train_loss={tr_loss:.4f}  "
+            f"val_loss={va_loss:.4f}  val_acc={va_acc:.4f}  val_f1={va_f1:.4f}  "
+            f"val_auc={va_auc:.4f}  val_recall_mal={va_rec_mal:.4f}"
+        )
 
-        # Guardado: siempre en epoch 1 y luego si mejora F1
-        should_save = (epoch == 1) or (va_f1 > best_f1 + 1e-4)
-        if should_save:
-            best_f1 = max(best_f1, va_f1)
+        improved = False
+        if (va_rec_mal >= TARGET_RECALL_MAL) and (not np.isnan(va_auc)) and (va_auc > best_auc + 1e-4):
+            improved = True
+
+        if improved:
+            best_auc = va_auc
             bad = 0
+
             torch.save({
                 "model": model.state_dict(),
                 "img_size": IMG_SIZE,
-                "note": "transfer+crop+classweights+2phase-finetune"
+                "note": "transfer+crop+sqrt_classweights+CE_loss+2phase_finetune+auc_ckpt_with_recall_constraint",
+                "best_val_auc": float(best_auc),
+                "target_recall_mal": float(TARGET_RECALL_MAL),
             }, SAVE_PATH)
             print("✅ Guardado checkpoint:", SAVE_PATH)
         else:
@@ -343,14 +497,46 @@ def train():
 
     print("Existe best_model.pt?", os.path.exists(SAVE_PATH))
 
-    # Test final
+    # =========================
+    # Evaluación FINAL con el mejor modelo + THRESHOLD balanceado en VAL
+    # =========================
     ckpt = torch.load(SAVE_PATH, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
 
-    te_loss, te_acc, te_f1, ys, preds = eval_epoch(model, dl_te, ce)
-    print(f"TEST: loss={te_loss:.4f} acc={te_acc:.4f} f1={te_f1:.4f}")
-    print("Confusion matrix:\n", confusion_matrix(ys, preds))
-    print(classification_report(ys, preds, digits=4))
+    # VAL -> seleccionar threshold que mantiene recall_mal >= 0.95 y maximiza balanced accuracy
+    va_loss, va_acc, va_f1, va_auc, va_rec_mal, ys_va, _, p_mal_va = eval_epoch(model, dl_va, loss_fn)
+
+    best_thr, best_cm, best_m = find_best_threshold_on_val(
+        ys_val=ys_va,
+        p_mal_val=p_mal_va,
+        target_recall_mal=TARGET_RECALL_MAL,
+        mode=THRESH_MODE,
+        n_grid=THRESH_GRID
+    )
+
+    print("\n==============================")
+    print("THRESHOLD SELECCIONADO EN VAL")
+    print(f"target_recall_mal={TARGET_RECALL_MAL}  mode={THRESH_MODE}  grid={THRESH_GRID}")
+    print(f"best_threshold={best_thr:.4f}")
+    print(f"VAL @thr: acc={best_m['acc']:.4f}  prec_mal={best_m['prec_mal']:.4f}  "
+          f"rec_mal={best_m['rec_mal']:.4f}  spec={best_m['spec']:.4f}  "
+          f"f1_mal={best_m['f1_mal']:.4f}  bal_acc={best_m['bal_acc']:.4f}")
+    print("VAL confusion @thr:\n", best_cm)
+    print("==============================\n")
+
+    # TRAIN(EVAL)
+    tr_loss_e, _, _, tr_auc_e, _, ys_tr, _, p_mal_tr = eval_epoch(model, dl_tr_eval, loss_fn)
+    print(f"\nTRAIN(EVAL): loss={tr_loss_e:.4f} auc={tr_auc_e:.4f} (thresholded report)")
+    print_threshold_report("TRAIN(EVAL)", ys_tr, p_mal_tr, best_thr)
+
+    # VAL
+    print(f"\nVAL: loss={va_loss:.4f} auc={va_auc:.4f} (thresholded report)")
+    print_threshold_report("VAL", ys_va, p_mal_va, best_thr)
+
+    # TEST
+    te_loss, _, _, te_auc, _, ys_te, _, p_mal_te = eval_epoch(model, dl_te, loss_fn)
+    print(f"\nTEST: loss={te_loss:.4f} auc={te_auc:.4f} (thresholded report)")
+    print_threshold_report("TEST", ys_te, p_mal_te, best_thr)
 
 
 if __name__ == "__main__":
